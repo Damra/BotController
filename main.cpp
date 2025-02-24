@@ -310,9 +310,25 @@ public:
     }
 };
 
-// Kullanım
-int main() {
-    BotController bot;
-    bot.StartBot();
+// Thread fonksiyonu
+DWORD WINAPI BotThread(LPVOID lpParam) {
+    BotController* bot = new BotController();
+    bot->StartBot();
+    delete bot; // Thread bittiğinde temizlik
     return 0;
+}
+
+// DLL giriş noktası
+BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserved) {
+    switch (ul_reason_for_call) {
+    case DLL_PROCESS_ATTACH:
+        // DLL yüklendiğinde thread başlat
+        CreateThread(NULL, 0, BotThread, NULL, 0, NULL);
+        break;
+    case DLL_THREAD_ATTACH:
+    case DLL_THREAD_DETACH:
+    case DLL_PROCESS_DETACH:
+        break;
+    }
+    return TRUE;
 }
