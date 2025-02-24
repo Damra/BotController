@@ -6,11 +6,14 @@
 #include <fstream>
 #include <string>
 #include <vector>
+#include <queue>
+#include <map>
+#include <set>
 
 #pragma comment(lib, "d3d9.lib")
 #pragma comment(lib, "d3dx9.lib")
 
-// Sabitler
+// Sabitler 
 #define KO_PTR_GameProcMain 0x10B8A34
 #define KO_PTR_FNC_TARGET_SELECT 0x7FAF70
 #define KO_PTR_FNC_ATTACK 0x7FB000
@@ -29,7 +32,7 @@
 #define KO_PTR_MINIMAP_BASE 0x10BD000
 #define KO_PTR_MINIMAP_TEXTURE 0x10BE000
 
-// Config
+// Config 
 struct BotConfig {
     int zoneX = 100;
     int zoneY = 200;
@@ -86,7 +89,7 @@ struct RadarEntity {
     DWORD address;
     int x;
     int y;
-    int type; // 1: Mob, 2: Oyuncu, 3: Obje
+    int type; // 1: Mob, 2: Oyuncu, 3: Eşya
     char name[32];
 };
 
@@ -96,6 +99,14 @@ struct MinimapInfo {
     int width;
     int height;
     float scale;
+};
+
+// Graf için node (düğüm) yapısı
+struct Node {
+    int x, y;
+    Node(int _x, int _y) : x(_x), y(_y) {}
+    bool operator<(const Node& other) const { return x < other.x || (x == other.x && y < other.y); }
+    bool operator==(const Node& other) const { return x == other.x && y == other.y; }
 };
 
 // DirectX Hook için global değişkenler
@@ -127,6 +138,7 @@ public:
     virtual std::vector<RadarEntity> GetRadarEntities() = 0;
     virtual MinimapInfo GetMinimapInfo() = 0;
     virtual LPDIRECT3DTEXTURE9 GetMapTexture() = 0;
+    virtual bool IsWalkable(int x, int y) = 0; // Yeni: Engel kontrolü
 };
 
 class GameMemoryRepository : public IGameMemoryRepository {
@@ -343,6 +355,12 @@ public:
         DWORD textureAddr = *(DWORD*)KO_PTR_MINIMAP_TEXTURE;
         return textureAddr ? (LPDIRECT3DTEXTURE9)textureAddr : nullptr;
     }
+
+    bool IsWalkable(int x, int y) override {
+        // TODO: Oyunda harita engellerini kontrol et
+        // Örneğin: x ve y’nin belirli bir aralıkta ve engelsiz olduğunu varsayalım
+        return (x >= 0 && x < 1000 && y >= 0 && y < 1000); // Basit bir sınır kontrolü
+    }
 };
 
 // DirectX Hook fonksiyonu
@@ -385,7 +403,53 @@ void HookDirectX() {
     pD3D->Release();
 }
 
-// 3. Use Cases: BusinessLogic
+// Dijkstra algoritması
+std::vector<Node> Dijkstra(IGameMemoryRepository* repo, Node start, Node goal) {
+    std::map<Node, int> dist;
+    std::map<Node, Node> prev;
+    auto cmp = [](const std::pair<int, Node>& a, const std::pair<int, Node>& b) { return a.first > b.first; };
+    std::priority_queue<std::pair<int, Node>, std::vector<std::pair<int, Node>>, decltype(cmp)> pq(cmp);
+    std::set<Node> visited;
+
+    dist[start] = 0;
+    pq.push({ 0, start });
+
+    int directions[4][2] = { {0, 1}, {1, 0}, {0, -1}, {-1, 0} }; // 4 yönlü hareket
+
+    while (!pq.empty()) {
+        Node current = pq.top().second;
+        int currentDist = pq.top().first;
+        pq.pop();
+
+        if (visited.count(current)) continue;
+        visited.insert(current);
+
+        if (current == goal) break;
+
+        for (auto& dir : directions) {
+            Node next(current.x + dir[0], current.y + dir[1]);
+            if (!repo->IsWalkable(next.x, next.y)) continue;
+
+            int newDist = currentDist + 1; // Her adım 1 birim mesafe
+            if (!dist.count(next) || newDist < dist[next]) {
+                dist[next] = newDist;
+                prev[next] = current;
+                pq.push({ newDist, next });
+            }
+        }
+    }
+
+    std::vector<Node> path;
+    Node current = goal;
+    while (dist.count(current)) {
+        path.push_back(current);
+        current = prev[current];
+    }
+    std::reverse(path.begin(), path.end());
+    return path;
+}
+
+// 3. Use Cases: Business Logic
 class AutoAttackUseCase {
     IGameMemoryRepository* repository;
 public:
@@ -535,11 +599,11 @@ class RadarUseCase {
         int mapX = minimap.xOffset + static_cast<int>((entity.x * minimap.scale));
         int mapY = minimap.yOffset + static_cast<int>((entity.y * minimap.scale));
         float distance = sqrt(pow(entity.x - player.x, 2) + pow(entity.y - player.y, 2));
-        D3DXVECTOR3 pos;
+
         g_pSprite->Begin(D3DXSPRITE_ALPHABLEND);
         switch (entity.type) {
         case 1: // Mob (kırmızı daire)
-            pos = D3DXVECTOR3(mapX - 4, mapY - 4, 0);
+            D3DXVECTOR3 pos(mapX - 4, mapY - 4, 0);
             g_pSprite->Draw(NULL, NULL, NULL, &pos, D3DCOLOR_ARGB(255, 255, 0, 0));
             break;
         case 2: // Oyuncu (mavi üçgen)
@@ -624,6 +688,41 @@ public:
     }
 };
 
+// Yeni: Dijkstra Hareket Use Case
+class DijkstraMoveUseCase {
+    IGameMemoryRepository* repository;
+    std::vector<Node> currentPath;
+    size_t pathIndex = 0;
+
+public:
+    DijkstraMoveUseCase(IGameMemoryRepository* repo) : repository(repo) {}
+
+    void SetTarget(int targetX, int targetY) {
+        PlayerEntity player = repository->GetPlayerEntity();
+        Node start(player.x, player.y);
+        Node goal(targetX, targetY);
+        currentPath = Dijkstra(repository, start, goal);
+        pathIndex = 0;
+    }
+
+    void Execute() {
+        if (pathIndex < currentPath.size()) {
+            Node next = currentPath[pathIndex];
+            PlayerEntity player = repository->GetPlayerEntity();
+            if (abs(player.x - next.x) <= 1 && abs(player.y - next.y) <= 1) {
+                pathIndex++;
+            }
+            else {
+                repository->MoveToPosition(next.x, next.y);
+            }
+        }
+    }
+
+    bool IsPathComplete() const {
+        return pathIndex >= currentPath.size();
+    }
+};
+
 // 4. Controller: Bot sınıfı
 class KOBotController {
     IGameMemoryRepository* memoryRepo;
@@ -638,6 +737,7 @@ class KOBotController {
     ChatBotUseCase* chatBot;
     BuffManagementUseCase* buffManagement;
     RadarUseCase* radar;
+    DijkstraMoveUseCase* dijkstraMove; // Yeni
     BotConfig config;
     HWND guiWindow;
     bool botEnabled = true;
@@ -672,6 +772,7 @@ public:
         chatBot = new ChatBotUseCase(memoryRepo);
         buffManagement = new BuffManagementUseCase(memoryRepo, config.buffSkillId);
         radar = new RadarUseCase(memoryRepo);
+        dijkstraMove = new DijkstraMoveUseCase(memoryRepo);
 
         HookDirectX();
 
@@ -689,6 +790,7 @@ public:
 
     ~KOBotController() {
         DestroyWindow(guiWindow);
+        delete dijkstraMove;
         delete radar;
         delete buffManagement;
         delete chatBot;
@@ -705,6 +807,7 @@ public:
 
     void StartBot() {
         MSG msg;
+        bool targetSet = false;
         while (true) {
             if (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE)) {
                 TranslateMessage(&msg);
@@ -713,6 +816,27 @@ public:
             }
 
             if (botEnabled) {
+                std::vector<RadarEntity> entities = memoryRepo->GetRadarEntities();
+                PlayerEntity player = memoryRepo->GetPlayerEntity();
+
+                // En yakın düşmanı bul ve Dijkstra ile hareket et
+                if (!targetSet || dijkstraMove->IsPathComplete()) {
+                    int minDist = INT_MAX;
+                    int targetX = player.x, targetY = player.y;
+                    for (const RadarEntity& entity : entities) {
+                        if (entity.type == 1) { // Mob hedefliyoruz
+                            int dist = static_cast<int>(sqrt(pow(entity.x - player.x, 2) + pow(entity.y - player.y, 2)));
+                            if (dist < minDist) {
+                                minDist = dist;
+                                targetX = entity.x;
+                                targetY = entity.y;
+                            }
+                        }
+                    }
+                    dijkstraMove->SetTarget(targetX, targetY);
+                    targetSet = true;
+                }
+
                 DWORD target = memoryRepo->FindNearestEnemy();
                 autoAttack->Execute(target);
                 autoLoot->Execute();
@@ -724,6 +848,7 @@ public:
                 autoNPC->Execute();
                 chatBot->Execute();
                 buffManagement->Execute();
+                dijkstraMove->Execute();
                 radar->Execute();
             }
             Sleep(200);
